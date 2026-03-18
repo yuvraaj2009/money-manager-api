@@ -10,8 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.middleware.error_handler import register_error_handlers
 from app.middleware.logging import RequestLoggingMiddleware
+from app.routes.accounts import router as accounts_router
 from app.routes.auth import router as auth_router
+from app.routes.categories import router as categories_router
 from app.routes.debug import router as debug_router
+from app.routes.transactions import router as transactions_router
 
 # Structured logging setup
 logging.basicConfig(
@@ -46,6 +49,9 @@ def create_app() -> FastAPI:
 
     # Routes
     app.include_router(auth_router)
+    app.include_router(transactions_router)
+    app.include_router(categories_router)
+    app.include_router(accounts_router)
     app.include_router(debug_router)
 
     @app.get("/")
