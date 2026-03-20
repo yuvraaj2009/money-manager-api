@@ -6,7 +6,8 @@ Auto-categorizes by keyword matching. SHA-256 dedup.
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
@@ -21,6 +22,7 @@ class ParsedSMS:
     confidence: str  # high / medium / low
     category_keyword: Optional[str]  # matched keyword for auto-categorization
     sms_hash: str
+    transaction_date: Optional[datetime] = field(default=None)
 
 
 # Bank regex patterns: each returns (amount_str, txn_type)
@@ -84,6 +86,40 @@ BANK_PATTERNS = [
                 re.IGNORECASE,
             ),
         ],
+    },
+    # PNB: "A/c XX4235 debited INR 800.00 Dt 16-03-26 19:25:18 thru UPI:..."
+    {
+        "name": "PNB",
+        "identifiers": ["PNBSMS", "PNB"],
+        "patterns": [
+            re.compile(
+                r"A/c\s+\w+\s+(debited|credited)\s+INR\s+([\d,]+\.?\d*)",
+                re.IGNORECASE,
+            ),
+        ],
+        "date_pattern": re.compile(
+            r"Dt\s+(\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
+            re.IGNORECASE,
+        ),
+        "merchant_pattern": re.compile(
+            r"thru\s+(?:UPI:)?(.+?)\.?Bal",
+            re.IGNORECASE,
+        ),
+    },
+    # BOB OneCard: "spent Rs. 525.00 at Zepto" or "paid USD 23.60 at Claude.ai"
+    {
+        "name": "BOB_ONECARD",
+        "identifiers": ["BOBONE", "BOBCARD", "BOB"],
+        "patterns": [
+            re.compile(
+                r"(?:spent|paid)\s+(?:Rs\.?|INR|USD)\s*([\d,]+\.?\d*)\s+at\s+(.+?)\s+with\s+your\s+BOBCARD",
+                re.IGNORECASE,
+            ),
+        ],
+        "currency_pattern": re.compile(
+            r"(?:spent|paid)\s+(Rs\.?|INR|USD)",
+            re.IGNORECASE,
+        ),
     },
     # Generic fallback for any bank
     {
@@ -217,6 +253,22 @@ def _auto_categorize(merchant: Optional[str], sms_body: str) -> tuple[Optional[s
     return None, "low"
 
 
+def _extract_date_from_sms(sms_body: str, bank_config: dict) -> Optional[datetime]:
+    """Extract transaction date from SMS if bank has a date pattern."""
+    date_pattern = bank_config.get("date_pattern")
+    if not date_pattern:
+        return None
+    match = date_pattern.search(sms_body)
+    if not match:
+        return None
+    date_str = match.group(1)
+    # PNB format: DD-MM-YY HH:MM:SS
+    try:
+        return datetime.strptime(date_str, "%d-%m-%y %H:%M:%S")
+    except ValueError:
+        return None
+
+
 def parse_sms(sms_body: str, timestamp: str, sender: Optional[str] = None) -> Optional[ParsedSMS]:
     """
     Parse a single SMS message. Returns ParsedSMS or None if not a transaction SMS.
@@ -227,6 +279,9 @@ def parse_sms(sms_body: str, timestamp: str, sender: Optional[str] = None) -> Op
     # Try bank-specific patterns first, then generic
     amount = None
     txn_type = None
+    bob_merchant = None
+    txn_date = None
+    matched_config = None
 
     for bank_config in BANK_PATTERNS:
         # Skip non-matching bank-specific patterns
@@ -239,18 +294,27 @@ def parse_sms(sms_body: str, timestamp: str, sender: Optional[str] = None) -> Op
             match = pattern.search(sms_body)
             if match:
                 groups = match.groups()
-                if len(groups) == 2:
-                    # Determine which group is amount and which is type
+
+                # BOB OneCard: groups = (amount, merchant)
+                if bank_config["name"] == "BOB_ONECARD" and len(groups) == 2:
+                    amount = _parse_amount(groups[0])
+                    txn_type = "expense"  # spent/paid is always debit
+                    bob_merchant = groups[1].strip()
+                    matched_config = bank_config
+                elif len(groups) == 2:
+                    # Standard: determine which group is amount and which is type
                     if groups[0].replace(",", "").replace(".", "").isdigit():
                         amount_str, type_str = groups[0], groups[1]
                     else:
                         type_str, amount_str = groups[0], groups[1]
                     amount = _parse_amount(amount_str)
                     txn_type = "expense" if type_str.lower() in ("debited", "spent") else "income"
+                    matched_config = bank_config
                 elif len(groups) == 1:
                     # Axis "spent" pattern - only amount, always expense
                     amount = _parse_amount(groups[0])
                     txn_type = "expense"
+                    matched_config = bank_config
                 break
         if amount is not None:
             break
@@ -276,11 +340,29 @@ def parse_sms(sms_body: str, timestamp: str, sender: Optional[str] = None) -> Op
     if amount is None:
         return None
 
-    merchant = _extract_merchant(sms_body)
+    # Extract date from SMS if available (e.g., PNB)
+    if matched_config:
+        txn_date = _extract_date_from_sms(sms_body, matched_config)
+
+    # Extract merchant — BOB has it in the regex, PNB has a special pattern
+    if bob_merchant:
+        merchant = bob_merchant
+    elif matched_config and matched_config.get("merchant_pattern"):
+        m = matched_config["merchant_pattern"].search(sms_body)
+        merchant = m.group(1).strip().rstrip(".") if m else _extract_merchant(sms_body)
+    else:
+        merchant = _extract_merchant(sms_body)
+
     category_name, confidence = _auto_categorize(merchant, sms_body)
 
-    # Build description
+    # Build description — append (USD) for foreign currency BOB transactions
     description = merchant or sms_body[:100]
+    if matched_config and matched_config["name"] == "BOB_ONECARD":
+        curr_pat = matched_config.get("currency_pattern")
+        if curr_pat:
+            curr_match = curr_pat.search(sms_body)
+            if curr_match and curr_match.group(1).upper() == "USD":
+                description = f"{description} (USD)"
 
     return ParsedSMS(
         amount=amount,
@@ -291,4 +373,5 @@ def parse_sms(sms_body: str, timestamp: str, sender: Optional[str] = None) -> Op
         confidence=confidence,
         category_keyword=category_name,
         sms_hash=sms_hash,
+        transaction_date=txn_date,
     )

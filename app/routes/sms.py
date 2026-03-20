@@ -18,6 +18,7 @@ from app.models.user import User
 from app.schemas.sms import SMSBatchRequest, SMSParseRequest
 from app.schemas.transaction import TransactionResponse
 from app.services.sms_parser import ParsedSMS, parse_sms
+from datetime import date as date_type
 
 router = APIRouter(prefix="/sms", tags=["sms"])
 
@@ -117,13 +118,14 @@ async def _save_parsed_sms(
 
     category_id = await _find_category_by_name(db, user_id, parsed.category_keyword, parsed.type)
 
-    from datetime import date as date_type
-
-    # Parse date from timestamp if possible
-    try:
-        txn_date = date_type.fromisoformat(transaction_date[:10])
-    except (ValueError, IndexError):
-        txn_date = date_type.today()
+    # Use date from SMS parsing if available, otherwise from timestamp param
+    if parsed.transaction_date:
+        txn_date = parsed.transaction_date.date()
+    else:
+        try:
+            txn_date = date_type.fromisoformat(transaction_date[:10])
+        except (ValueError, IndexError):
+            txn_date = date_type.today()
 
     txn = Transaction(
         user_id=user_id,
@@ -154,6 +156,7 @@ def _parsed_to_dict(parsed: ParsedSMS) -> dict:
         "confidence": parsed.confidence,
         "suggested_category": parsed.category_keyword,
         "sms_hash": parsed.sms_hash,
+        "transaction_date": parsed.transaction_date.isoformat() if parsed.transaction_date else None,
     }
 
 
